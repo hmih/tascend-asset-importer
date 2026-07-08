@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: psk_psa_py
+Version: 0.0.4
+Project-URL: Homepage, https://github.com/DarklightGames/psk_psa_py
+Project-URL: Issues, https://github.com/DarklightGames/psk_psa_py/issues
+Author-email: Colin Basnett <cmbasnett@proton.me>
+License-Expression: MIT
+License-File: LICENSE
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >3.9
+Description-Content-Type: text/markdown
+
+# psk_psa_py
+Python module for reading and writing PSK and PSA files

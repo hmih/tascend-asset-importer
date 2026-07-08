@@ -1,0 +1,6 @@
+[submodule "vendor/UEViewer"]
+	path = vendor/UEViewer
+	url = git@github.com:hmih/UEViewer.git
+[submodule "vendor/UELib"]
+	path = vendor/UELib
+	url = git@github.com:hmih/uelib.git
