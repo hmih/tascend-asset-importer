@@ -7,3 +7,4 @@ output/
 slicer/bin/
 slicer/obj/
 slicer/gen/
+__pycache__/
