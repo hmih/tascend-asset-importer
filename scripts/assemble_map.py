@@ -794,10 +794,13 @@ def _make_node(
     instance: MeshInstance,
     node_index: int,
 ) -> Dict[str, Any]:
-    """Create a glTF node dict from a MeshInstance. Kept in UE3 space."""
+    """Create a glTF node dict from a MeshInstance. Kept in UE3 space.
+    
+    Scale components use absolute values — negative UE3 scales cause
+    winding failures when combined with the reflection root matrix (det=-1)."""
     pos = instance.location
     rot = instance.rotation if instance.rotation else Quat.identity()
-    scl = instance.scale
+    scl = Vec3(abs(instance.scale.x), abs(instance.scale.y), abs(instance.scale.z))
 
     return {
         "mesh": mesh_idx,
