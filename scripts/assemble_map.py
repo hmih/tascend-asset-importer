@@ -245,6 +245,7 @@ def parse_component_ref(value: str) -> Optional[Tuple[str, str]]:
 class ActorJsonObject:
     name: str
     class_: str
+    outer: str
     properties: List[Dict[str, str]]
 
 
@@ -256,6 +257,7 @@ def _load_actor_objects(path: str) -> List[ActorJsonObject]:
         ActorJsonObject(
             name=obj.get('name', ''),
             class_=obj.get('class', ''),
+            outer=obj.get('outer', '') or '',
             properties=obj.get('properties', []),
         )
         for obj in data.get('objects', [])
@@ -801,7 +803,7 @@ def _make_node(
         "mesh": mesh_idx,
         "name": instance.actor_name or f"instance_{node_index}",
         "translation": list(pos),
-        "rotation": list(rot),
+        "rotation": [rot.x, rot.y, -rot.z, rot.w],
         "scale": list(scl),
         "extras": {
             "mesh_ref": instance.mesh_ref,
