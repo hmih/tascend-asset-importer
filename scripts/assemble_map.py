@@ -781,11 +781,7 @@ def _make_node(
     instance: MeshInstance,
     node_index: int,
 ) -> Dict[str, Any]:
-    """Create a glTF node dict from a MeshInstance.
-
-    Quaternion YZ components are swapped to match the root node's axis remap:
-    UE3 Y → glTF Z, UE3 Z → glTF Y. The root matrix handles position conversion.
-    """
+    """Create a glTF node dict from a MeshInstance. Kept in UE3 space."""
     pos = instance.location
     rot = instance.rotation if instance.rotation else Quat.identity()
     scl = instance.scale
@@ -794,7 +790,7 @@ def _make_node(
         "mesh": mesh_idx,
         "name": instance.actor_name or f"instance_{node_index}",
         "translation": list(pos),
-        "rotation": [rot.x, rot.z, rot.y, rot.w],
+        "rotation": list(rot),
         "scale": list(scl),
         "extras": {
             "mesh_ref": instance.mesh_ref,
