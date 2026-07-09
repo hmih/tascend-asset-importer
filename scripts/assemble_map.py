@@ -267,6 +267,10 @@ def _build_component_mesh_index(objects: List[ActorJsonObject]) -> Dict[str, Lis
 
     Scans each object's properties for StaticMesh/SkeletalMesh references.
     Returns: {component_name: [(MeshType, 'Package.Group.Name'), ...]}
+
+    Component names are scoped by their outer (parent) name to avoid
+    collisions between actors (e.g. two actors can each have a child
+    named 'StaticMeshComponent_1' with different meshes).
     """
     index: Dict[str, List[Tuple[MeshType, str]]] = {}
     for obj in objects:
@@ -279,7 +283,8 @@ def _build_component_mesh_index(objects: List[ActorJsonObject]) -> Dict[str, Lis
             elif 'StaticMesh=' in pval or 'SkeletalMesh=' in pval:
                 refs.extend(parse_mesh_refs(pval))
         if refs:
-            index[obj.name] = refs
+            key = f"{obj.outer}.{obj.name}" if obj.outer else obj.name
+            index[key] = refs
     return index
 
 
@@ -339,12 +344,18 @@ def _find_mesh_refs(
 
         # Component references (e.g. StaticMeshComponent=StaticMeshComponent_768)
         comp_ref = parse_component_ref(pval)
-        if comp_ref and comp_ref[1] in component_mesh_index:
-            for mt, path in component_mesh_index[comp_ref[1]]:
-                key = (mt, path)
-                if key not in seen:
-                    seen.add(key)
-                    refs.append((mt, path))
+        if comp_ref:
+            type_name, comp_name = comp_ref
+            # Try scoped lookup first (ActorName.ComponentName), then bare name
+            scoped = f"{obj.name}.{comp_name}" if obj.name else comp_name
+            for key in (scoped, comp_name):
+                if key in component_mesh_index:
+                    for mt, path in component_mesh_index[key]:
+                        k = (mt, path)
+                        if k not in seen:
+                            seen.add(k)
+                            refs.append((mt, path))
+                    break
 
     return refs
 
