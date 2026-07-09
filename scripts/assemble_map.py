@@ -192,7 +192,10 @@ _ROTATOR_RE = re.compile(r'Pitch=([\-\d]+)\s*,?\s*Yaw=([\-\d]+)\s*,?\s*Roll=([\-
 _FLOAT_RE = re.compile(r'=([\-\d.]+)')
 _MESH_REF_RE = re.compile(r"(StaticMesh|SkeletalMesh)=\1'([^']+)'")
 _COMPONENT_REF_RE = re.compile(r'(\w+)=(\w+_\d+)\s*$')
-_MAP_VARIANT_PREFIXES = re.compile(r'^(TrCTF-|TrCTFBlitz-|TrArena-|TrRabbit-|TrTeamRabbit-|TrCaH-|TrTraining-)')
+_MAP_VARIANT_PREFIXES = re.compile(
+    r'^(TrCTF-|TrCTFBlitz-|TrArena-|TrRabbit-|TrTeamRabbit-|TrCaH-|TrTraining-)'
+)
+_LAYER_SUFFIXES = ['_Sound', '_Ter', '_TER', '_Visuals', '_Cameras', '_Visuals']
 
 
 def parse_vec3(value: str) -> Optional[Vec3]:
@@ -388,23 +391,76 @@ def extract_mesh_instances(actors_json_path: str) -> List[MeshInstance]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def discover_maps(actors_dir: str) -> Dict[str, List[str]]:
-    """Scan an actors directory and group .actors.json files by base map name.
+    """Scan an actors directory and group .actors.json files by map variant.
 
-    Strips known variant prefixes (TrCTF-, TrArena-, etc.) and layer suffixes
-    (_Sound, _Ter, _TER, _Visuals, _Cameras) to produce the base map name.
+    Each game mode (CTF, Rabbit, Blitz, etc.) is assembled as a separate map.
+    Base layers (files without a game-mode prefix, e.g. ``ArxNovena_TER``) are
+    shared across all variants of the same base map.
+
+    Naming convention:
+      - ``ArxNovena_TER.actors.json``         → base layer of ArxNovena
+      - ``ArxNovena_Sound.actors.json``       → base layer of ArxNovena
+      - ``TrCTF-ArxNovena.actors.json``        → CTF actors (default variant)
+      - ``TrRabbit-ArxNovena.actors.json``     → Rabbit variant
+      - ``TrTeamRabbit-ArxNovena_Ter.actors.json`` → TeamRabbit terrain layer
+
+    Output map names:
+      - CTF (default): ``ArxNovena``
+      - Other modes:   ``TrRabbit-ArxNovena``, ``TrCTFBlitz-ArxNovena``, etc.
+
+    Each variant map includes all base layers + its own mode-specific layers.
     """
-    maps: Dict[str, List[str]] = {}
     if not os.path.isdir(actors_dir):
-        return maps
+        return {}
+
+    # Parse each file into (base_name, mode_prefix, full_path)
+    base_files: Dict[str, List[str]] = {}   # base_name → [paths]
+    variant_files: Dict[str, Dict[str, List[str]]] = {}  # base_name → {mode → [paths]}
+
     for fname in sorted(os.listdir(actors_dir)):
         if not fname.endswith('.actors.json'):
             continue
-        name = _MAP_VARIANT_PREFIXES.sub('', fname.replace('.actors.json', ''))
-        for suffix in ['_Sound', '_Ter', '_TER', '_Visuals', '_Cameras']:
-            if name.endswith(suffix):
-                name = name[:-len(suffix)]
+        name = fname.replace('.actors.json', '')
+        path = os.path.join(actors_dir, fname)
+
+        mode_match = _MAP_VARIANT_PREFIXES.match(name)
+        if mode_match:
+            mode = mode_match.group(0)  # e.g. "TrCTF-", "TrRabbit-"
+            rest = name[len(mode):]
+        else:
+            mode = ""
+            rest = name
+
+        # Strip layer suffix to get the base map name
+        base = rest
+        for suffix in _LAYER_SUFFIXES:
+            if rest.endswith(suffix):
+                base = rest[:-len(suffix)]
                 break
-        maps.setdefault(name, []).append(os.path.join(actors_dir, fname))
+
+        if mode == "":
+            base_files.setdefault(base, []).append(path)
+        else:
+            variant_files.setdefault(base, {}).setdefault(mode, []).append(path)
+
+    # Build final map list: each variant gets base layers + its own layers
+    maps: Dict[str, List[str]] = {}
+
+    for base, modes in variant_files.items():
+        shared = base_files.get(base, [])
+        for mode in sorted(modes):
+            # CTF is the default game mode — use the bare base name
+            if mode == "TrCTF-":
+                map_name = base
+            else:
+                map_name = f"{mode}{base}"
+            maps[map_name] = shared + modes[mode]
+
+    # Handle maps that have base files but no game-mode variants
+    for base, paths in base_files.items():
+        if base not in variant_files:
+            maps[base] = paths
+
     return maps
 
 
@@ -513,12 +569,15 @@ def _resolve_textures_base(static_meshes_dir: str) -> str:
     """Find the absolute textures directory.
 
     The C++ glTF writer references images as '../textures/<path>' relative to the
-    static-meshes/ root. Since textures aren't copied into the gltf/ tree yet,
-    we resolve to output/raw/ (where UModel extracted the PNGs).
+    static-meshes/ root. The textures directory has a flat per-package structure
+    that doesn't match the deep raw/ paths, so we use raw/ directly.
     """
     gltf_dir = os.path.dirname(static_meshes_dir)
-    raw_dir = os.path.join(os.path.dirname(gltf_dir), "raw")
-    return raw_dir if os.path.isdir(raw_dir) else os.path.join(gltf_dir, "textures")
+    output_dir = os.path.dirname(gltf_dir)
+    raw_dir = os.path.join(output_dir, "raw")
+    if os.path.isdir(raw_dir):
+        return raw_dir
+    return os.path.join(gltf_dir, "textures")
 
 
 def _resolve_image_uri(uri: str, mesh_dir: str, textures_base: str) -> str:
@@ -741,16 +800,16 @@ def _make_node(
     }
 
 
-# Matrix converting UE3 (X=fwd,Y=right,Z=up) → glTF (X=right,Y=up,Z=-fwd).
-# Maps (x,y,z)_ue → (x,z,-y)_gltf. Pure rotation, det=1, preserves winding.
+# Matrix converting UE3 (X=fwd,Y=right,Z=up) → glTF (X=right,Y=up,Z=fwd with +Z=screen-up in top-down).
+# Maps (x,y,z)_ue → (x,z,y)_gltf. Reflection (det=-1); glTF inverts winding for mirrored nodes.
 # Column-major 4x4 for glTF node matrix.
-_UE3_TO_GLTF_MATRIX = [1, 0, 0, 0,  0, 0, -1, 0,  0, 1, 0, 0,  0, 0, 0, 1]
+_UE3_TO_GLTF_MATRIX = [1, 0, 0, 0,  0, 0, 1, 0,  0, 1, 0, 0,  0, 0, 0, 1]
 
 
 def _add_root_node(combined: Dict[str, Any], child_indices: List[int], world_scale: float = 1.0) -> None:
     """Add a root node with the UE3→glTF conversion matrix, parenting all instance nodes."""
     s = world_scale
-    matrix = [s, 0, 0, 0,  0, 0, -s, 0,  0, s, 0, 0,  0, 0, 0, 1]
+    matrix = [s, 0, 0, 0,  0, 0, s, 0,  0, s, 0, 0,  0, 0, 0, 1]
     root_node: Dict[str, Any] = {
         "name": "ue3_to_gltf_root",
         "matrix": matrix,
@@ -814,8 +873,11 @@ def assemble_map(
     print(f"  Resolved {len(mesh_ref_to_path)} unique meshes from {len(instances)} instances")
 
     if not mesh_ref_to_path:
-        print("ERROR: No meshes resolved.")
-        return 1
+        if not instances:
+            print("SKIP: No mesh instances in actor data (non-geometry map).")
+        else:
+            print(f"WARNING: {len(instances)} instances but 0 resolved meshes.")
+        return 0
 
     # 4. Load all unique mesh glTFs
     print(f"Loading {len(mesh_ref_to_path)} unique mesh glTFs...")
