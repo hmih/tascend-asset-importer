@@ -162,10 +162,10 @@ def ue3_scale_to_gltf(scale: Vec3) -> Vec3:
 
 
 def ue3_rotator_to_quat(pitch_units: int, yaw_units: int, roll_units: int) -> Quat:
-    """Convert UE3 rotator (Pitch/Yaw/Roll in Unreal rotation units) → glTF quaternion.
+    """Convert UE3 rotator (Pitch/Yaw/Roll in Unreal rotation units) → UE3 quaternion.
 
     UE3 rotation order: Yaw(Z) → Pitch(Y) → Roll(X), i.e. q = Roll * Pitch * Yaw.
-    Then conjugates with +90° X rotation to convert to glTF space.
+    The root node matrix handles UE3→glTF conversion, so quaternions stay in UE3 space.
     """
     def _half_angle(units: int) -> Tuple[float, float]:
         rad = (units / UNREAL_ROT_UNITS) * TWO_PI
@@ -180,8 +180,7 @@ def ue3_rotator_to_quat(pitch_units: int, yaw_units: int, roll_units: int) -> Qu
     q_pitch = Quat(0.0, sp, 0.0, cp)
     q_roll  = Quat(sr, 0.0, 0.0, cr)
 
-    q_ue3 = q_roll * q_pitch * q_yaw
-    return C_QUAT * q_ue3 * C_QUAT.conjugate()
+    return q_roll * q_pitch * q_yaw
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -193,6 +192,7 @@ _ROTATOR_RE = re.compile(r'Pitch=([\-\d]+)\s*,?\s*Yaw=([\-\d]+)\s*,?\s*Roll=([\-
 _FLOAT_RE = re.compile(r'=([\-\d.]+)')
 _MESH_REF_RE = re.compile(r"(StaticMesh|SkeletalMesh)=\1'([^']+)'")
 _COMPONENT_REF_RE = re.compile(r'(\w+)=(\w+_\d+)\s*$')
+_MAP_VARIANT_PREFIXES = re.compile(r'^(TrCTF-|TrCTFBlitz-|TrArena-|TrRabbit-|TrTeamRabbit-|TrCaH-|TrTraining-)')
 
 
 def parse_vec3(value: str) -> Optional[Vec3]:
@@ -384,6 +384,31 @@ def extract_mesh_instances(actors_json_path: str) -> List[MeshInstance]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Map discovery: group actor JSONs by base map name
+# ═══════════════════════════════════════════════════════════════════════════
+
+def discover_maps(actors_dir: str) -> Dict[str, List[str]]:
+    """Scan an actors directory and group .actors.json files by base map name.
+
+    Strips known variant prefixes (TrCTF-, TrArena-, etc.) and layer suffixes
+    (_Sound, _Ter, _TER, _Visuals, _Cameras) to produce the base map name.
+    """
+    maps: Dict[str, List[str]] = {}
+    if not os.path.isdir(actors_dir):
+        return maps
+    for fname in sorted(os.listdir(actors_dir)):
+        if not fname.endswith('.actors.json'):
+            continue
+        name = _MAP_VARIANT_PREFIXES.sub('', fname.replace('.actors.json', ''))
+        for suffix in ['_Sound', '_Ter', '_TER', '_Visuals', '_Cameras']:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+                break
+        maps.setdefault(name, []).append(os.path.join(actors_dir, fname))
+    return maps
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Mesh index: resolve UE3 mesh_ref → glTF filesystem path
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -406,12 +431,12 @@ def _gltf_mesh_refs(gltf_path: str) -> List[str]:
     results: List[str] = []
     for name in (s for s in sources if s):
         parts = name.split('/')
-        # Try 2-part (Package.Name): BellaOmega_NewRocks/SM_BellaOmega_HighLands_RockCombined
         if len(parts) >= 2:
             results.append('.'.join(parts[-2:]))
-        # Try 3-part (Package.Group.Name): BellaOmega_NewRocks/SM/SM_BellaOmega_HighLands_RockCombined
         if len(parts) >= 3:
             results.append('.'.join(parts[-3:]))
+        if len(parts) >= 4:
+            results.append('.'.join(parts[-4:]))
     return results
 
 
@@ -433,7 +458,9 @@ def build_mesh_index(mesh_dirs: Iterable[str]) -> MeshIndex:
                 if not mesh_refs:
                     rel = os.path.relpath(full_path, mesh_dir)
                     parts = Path(rel).with_suffix('').parts
-                    if len(parts) >= 3:
+                    if len(parts) >= 4:
+                        mesh_refs = ['.'.join(parts[-4:])]
+                    elif len(parts) >= 3:
                         mesh_refs = ['.'.join(parts[-3:])]
                     elif len(parts) == 2:
                         mesh_refs = ['.'.join(parts[-2:])]
@@ -695,10 +722,10 @@ def _make_node(
     instance: MeshInstance,
     node_index: int,
 ) -> Dict[str, Any]:
-    """Create a glTF node dict from a MeshInstance."""
-    pos = ue3_pos_to_gltf(instance.location)
+    """Create a glTF node dict from a MeshInstance. Kept in UE3 space."""
+    pos = instance.location
     rot = instance.rotation if instance.rotation else Quat.identity()
-    scl = ue3_scale_to_gltf(instance.scale)
+    scl = instance.scale
 
     return {
         "mesh": mesh_idx,
@@ -714,17 +741,39 @@ def _make_node(
     }
 
 
+# Matrix converting UE3 (X=fwd,Y=right,Z=up) → glTF (X=right,Y=up,Z=-fwd).
+# Maps (x,y,z)_ue → (x,z,-y)_gltf. Pure rotation, det=1, preserves winding.
+# Column-major 4x4 for glTF node matrix.
+_UE3_TO_GLTF_MATRIX = [1, 0, 0, 0,  0, 0, -1, 0,  0, 1, 0, 0,  0, 0, 0, 1]
+
+
+def _add_root_node(combined: Dict[str, Any], child_indices: List[int], world_scale: float = 1.0) -> None:
+    """Add a root node with the UE3→glTF conversion matrix, parenting all instance nodes."""
+    s = world_scale
+    matrix = [s, 0, 0, 0,  0, 0, -s, 0,  0, s, 0, 0,  0, 0, 0, 1]
+    root_node: Dict[str, Any] = {
+        "name": "ue3_to_gltf_root",
+        "matrix": matrix,
+        "children": child_indices,
+    }
+    combined["nodes"].append(root_node)
+    combined["scenes"][0]["nodes"] = [len(combined["nodes"]) - 1]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main orchestration
 # ═══════════════════════════════════════════════════════════════════════════
 
 def assemble_map(
-    actors_json_path: str,
+    actors_json_paths: List[str],
     static_meshes_dir: str,
     skeletal_meshes_dir: Optional[str],
     output_path: str,
+    world_scale: float = 1.0,
 ) -> int:
-    print(f"Assembling map from: {actors_json_path}")
+    print(f"Assembling map from {len(actors_json_paths)} actor file(s):")
+    for p in actors_json_paths:
+        print(f"  {p}")
 
     # 1. Build mesh index
     print("Building mesh index...")
@@ -735,9 +784,11 @@ def assemble_map(
     total_files = sum(len(v) for v in mesh_index.values())
     print(f"  Indexed {len(mesh_index)} unique mesh references from {total_files} files")
 
-    # 2. Extract mesh instances
+    # 2. Extract mesh instances from all actor JSONs
     print("Extracting mesh instances...")
-    instances = extract_mesh_instances(actors_json_path)
+    instances: List[MeshInstance] = []
+    for path in actors_json_paths:
+        instances.extend(extract_mesh_instances(path))
     print(f"  Found {len(instances)} mesh instances")
 
     # 3. Resolve mesh references
@@ -786,17 +837,21 @@ def assemble_map(
     # 6. Build mesh_ref → combined mesh index
     mesh_ref_to_idx = _build_mesh_ref_index(gltf_files, mesh_ref_to_path)
 
-    # 7. Create instance nodes
+    # 7. Create instance nodes (UE3 space, root node converts to glTF)
     node_idx = 0
+    instance_indices: List[int] = []
     for inst in instances:
         mr = inst.mesh_ref
         if mr not in mesh_ref_to_idx:
             continue
         combined["nodes"].append(_make_node(mesh_ref_to_idx[mr], inst, node_idx))
-        combined["scenes"][0]["nodes"].append(node_idx)
+        instance_indices.append(node_idx)
         node_idx += 1
 
-    # 8. Write output
+    # 8. Add UE3→glTF conversion root node (parens all instances)
+    _add_root_node(combined, instance_indices, world_scale)
+
+    # 9. Write output
     with open(gltf_out_path, "w") as f:
         json.dump(combined, f, indent=2)
     with open(bin_out_path, "wb") as f:
@@ -813,19 +868,44 @@ def assemble_map(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Assemble a combined map glTF from actor JSON")
-    parser.add_argument("actors_json", help="Path to .actors.json file")
-    parser.add_argument("--output", "-o", default="output/maps", help="Output directory")
+    parser = argparse.ArgumentParser(description="Assemble combined map glTFs from actor JSONs")
+    parser.add_argument("actors_json", nargs='?', help="Path to a single .actors.json file")
+    parser.add_argument("--all", action="store_true", help="Assemble all maps in the actors directory")
+    parser.add_argument("--actors-dir", default="output/gltf/actors", help="Directory containing .actors.json files")
+    parser.add_argument("--output", "-o", default="output/gltf/maps", help="Output directory for combined map glTFs")
     parser.add_argument("--static-meshes", default="output/gltf/static-meshes", help="Static meshes directory")
     parser.add_argument("--skeletal-meshes", default="output/gltf/skeletal-meshes", help="Skeletal meshes directory")
+    parser.add_argument("--world-scale", type=float, default=1.0, help="Scale factor applied to entire world (0.01 for cm->m)")
     args = parser.parse_args()
+
+    if args.all:
+        maps = discover_maps(args.actors_dir)
+        if not maps:
+            print(f"No .actors.json files found in {args.actors_dir}")
+            sys.exit(1)
+        print(f"Found {len(maps)} maps to assemble")
+        failed = 0
+        for map_name, json_paths in sorted(maps.items()):
+            print(f"\n{'='*60}")
+            print(f"Map: {map_name} ({len(json_paths)} files)")
+            output_path = os.path.join(args.output, map_name, map_name + ".gltf")
+            rc = assemble_map(json_paths, args.static_meshes, args.skeletal_meshes,
+                              output_path, args.world_scale)
+            if rc != 0:
+                failed += 1
+        print(f"\nDone. {len(maps)} maps processed, {failed} failed.")
+        sys.exit(0 if failed == 0 else 1)
+
+    if not args.actors_json:
+        parser.error("Either specify an actors_json file or use --all")
 
     map_name = os.path.splitext(os.path.basename(args.actors_json))[0]
     if map_name.endswith(".actors"):
         map_name = map_name[:-7]
 
     output_path = os.path.join(args.output, map_name, map_name + ".gltf")
-    sys.exit(assemble_map(args.actors_json, args.static_meshes, args.skeletal_meshes, output_path))
+    sys.exit(assemble_map([args.actors_json], args.static_meshes, args.skeletal_meshes,
+                           output_path, args.world_scale))
 
 
 if __name__ == "__main__":
