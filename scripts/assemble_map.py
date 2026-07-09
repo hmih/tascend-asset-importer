@@ -803,7 +803,7 @@ def _make_node(
         "mesh": mesh_idx,
         "name": instance.actor_name or f"instance_{node_index}",
         "translation": list(pos),
-        "rotation": list(rot),
+        "rotation": [rot.x, rot.y, -rot.z, rot.w],
         "scale": list(scl),
         "extras": {
             "mesh_ref": instance.mesh_ref,
@@ -813,16 +813,16 @@ def _make_node(
     }
 
 
-# Matrix converting UE3 (X=fwd,Y=right,Z=up) → glTF (X=right,Y=up,Z=fwd).
-# Maps (-x,y,z)_ue → (x,z,y)_gltf. Pure rotation Rx(-90°)·Ry(180°), det=+1.
+# Matrix converting UE3 (X=fwd,Y=right,Z=up) → glTF (X=right,Y=up,Z=fwd with +Z=screen-up in top-down).
+# Maps (x,y,z)_ue → (x,z,y)_gltf. Reflection (det=-1); glTF inverts winding for mirrored nodes.
 # Column-major 4x4 for glTF node matrix.
-_UE3_TO_GLTF_MATRIX = [-1, 0, 0, 0,  0, 0, 1, 0,  0, 1, 0, 0,  0, 0, 0, 1]
+_UE3_TO_GLTF_MATRIX = [1, 0, 0, 0,  0, 0, 1, 0,  0, 1, 0, 0,  0, 0, 0, 1]
 
 
 def _add_root_node(combined: Dict[str, Any], child_indices: List[int], world_scale: float = 1.0) -> None:
     """Add a root node with the UE3→glTF conversion matrix, parenting all instance nodes."""
     s = world_scale
-    matrix = [-s, 0, 0, 0,  0, 0, s, 0,  0, s, 0, 0,  0, 0, 0, 1]
+    matrix = [s, 0, 0, 0,  0, 0, s, 0,  0, s, 0, 0,  0, 0, 0, 1]
     root_node: Dict[str, Any] = {
         "name": "ue3_to_gltf_root",
         "matrix": matrix,
