@@ -35,6 +35,13 @@ if (args[0] == "terrain-extract")
     return TerrainExtractor.Run(args[1..]);
 }
 
+// Object-model index mode: "index <pkg.u> <out.json> ..."
+// Emits the authoritative class/member index used to verify decompiler output.
+if (args[0] == "index")
+{
+    return IndexExtractor.Run(args[1..]);
+}
+
 // Single-package mode (backwards compatible)
 if (args[0] != "gen")
 {
@@ -49,8 +56,12 @@ if (args[0] != "gen")
         return 1;
     }
 
-    // Build NTL from the package itself (single-package mode)
-    var ntlPkg = BuildNativesTable(packagePath);
+    // Single-package mode used to build the natives table only from the package itself.
+    // That omits the engine's built-in operator tokens, so operators were silently
+    // emitted as unresolved names such as __NFUN_119__ instead of `!=`. Seed the
+    // standard UE3 table first, then merge in this package's own native functions.
+    var ntlPkg = UE3NativesTable.Create();
+    MergeNatives(ntlPkg, packagePath);
     DecompilePackage(packagePath, outputDir, ntlPkg);
     return 0;
 }
@@ -85,15 +96,7 @@ Console.WriteLine($"Loaded UE3 standard natives table: {ntlPackage.NativeTokenMa
 
 foreach (var (path, _) in packagePairs)
 {
-    var extra = BuildNativesTable(path);
-    foreach (var item in extra.NativeTableList)
-    {
-        if (!ntlPackage.NativeTokenMap.ContainsKey((ushort)item.ByteToken))
-        {
-            ntlPackage.NativeTableList.Add(item);
-            ntlPackage.NativeTokenMap[(ushort)item.ByteToken] = item;
-        }
-    }
+    MergeNatives(ntlPackage, path);
 }
 Console.WriteLine($"Total natives after scanning packages: {ntlPackage.NativeTokenMap.Count} entries");
 
@@ -117,6 +120,7 @@ if (UnrealConfig.VariableTypes == null)
 
 int totalEmitted = 0;
 int totalErrors = 0;
+int totalUnresolved = 0;
 
 foreach (var (_, outDir, pkg) in packages)
 {
@@ -134,6 +138,7 @@ foreach (var (_, outDir, pkg) in packages)
 
     var emitted = 0;
     var errors = 0;
+    var unresolved = 0;
 
     foreach (var cls in classes)
     {
@@ -142,6 +147,18 @@ foreach (var (_, outDir, pkg) in packages)
         {
             cls.Load<UObjectRecordStream>();
             var source = cls.Decompile();
+
+            // Unresolved generated names mean the emitted source is *wrong*, not merely
+            // ugly: __NFUN_119__(A, B) is an unresolved `!=`. Treat it as a hard error.
+            var unresolvedHere = CountUnresolvedNames(source, out var unresolvedNatives, out var unresolvedLocals);
+            if (unresolvedHere > 0)
+            {
+                Console.Error.WriteLine(
+                    $"  UNRESOLVED: {cls.Name}: {unresolvedNatives} native token(s), " +
+                    $"{unresolvedLocals} local(s) emitted as generated names");
+                unresolved += unresolvedHere;
+            }
+
             File.WriteAllText(filePath, source);
             emitted++;
         }
@@ -170,12 +187,15 @@ foreach (var (_, outDir, pkg) in packages)
     Console.WriteLine($"Decompiled {emitted} classes to: {outDir} (+{typesAdded} array types)");
     if (errors > 0)
         Console.WriteLine($"  ({errors} errors)");
+    if (unresolved > 0)
+        Console.WriteLine($"  ({unresolved} unresolved generated names)");
     totalEmitted += emitted;
     totalErrors += errors;
+    totalUnresolved += unresolved;
 }
 
-Console.WriteLine($"Total: {totalEmitted} classes, {totalErrors} errors across {packages.Count} packages ({UnrealConfig.VariableTypes.Count} array types).");
-return totalErrors > 0 ? 1 : 0;
+Console.WriteLine($"Total: {totalEmitted} classes, {totalErrors} errors, {totalUnresolved} unresolved names across {packages.Count} packages ({UnrealConfig.VariableTypes.Count} array types).");
+return totalErrors > 0 || totalUnresolved > 0 ? 1 : 0;
 
 // Build a Natives Table from a package's native functions.
 // This maps native function indices (e.g., 119) to their operator names (e.g., "!=").
@@ -245,6 +265,7 @@ static void DecompilePackage(string packagePath, string outputDir, NativesTableP
 
     var emitted = 0;
     var errors = 0;
+    var unresolved = 0;
 
     foreach (var cls in classes)
     {
@@ -253,6 +274,15 @@ static void DecompilePackage(string packagePath, string outputDir, NativesTableP
         {
             cls.Load<UObjectRecordStream>();
             var source = cls.Decompile();
+            var unresolvedHere = CountUnresolvedNames(source, out var unresolvedNatives, out var unresolvedLocals);
+            if (unresolvedHere > 0)
+            {
+                Console.Error.WriteLine(
+                    $"  UNRESOLVED: {cls.Name}: {unresolvedNatives} native token(s), " +
+                    $"{unresolvedLocals} local(s) emitted as generated names");
+                unresolved += unresolvedHere;
+            }
+
             File.WriteAllText(filePath, source);
             emitted++;
         }
@@ -273,6 +303,34 @@ static void DecompilePackage(string packagePath, string outputDir, NativesTableP
     Console.WriteLine($"Decompiled {emitted} classes to: {outputDir}");
     if (errors > 0)
         Console.WriteLine($"  ({errors} errors)");
+    if (unresolved > 0)
+        Console.WriteLine($"  ({unresolved} unresolved generated names)");
+}
+
+// Merge a package's native functions into an existing natives table, keeping the
+// first definition of each token. Used by both single-package and `gen` mode so the
+// two paths resolve operators identically.
+static void MergeNatives(NativesTablePackage target, string packagePath)
+{
+    var extra = BuildNativesTable(packagePath);
+    foreach (var item in extra.NativeTableList)
+    {
+        if (!target.NativeTokenMap.ContainsKey((ushort)item.ByteToken))
+        {
+            target.NativeTableList.Add(item);
+            target.NativeTokenMap[(ushort)item.ByteToken] = item;
+        }
+    }
+}
+
+// Count generated placeholder names in emitted source. Any nonzero result means the
+// decompiler could not resolve a native token or local variable, i.e. the emitted
+// source is semantically wrong rather than merely unpolished.
+static int CountUnresolvedNames(string source, out int natives, out int locals)
+{
+    natives = System.Text.RegularExpressions.Regex.Matches(source, @"__NFUN_\d+__").Count;
+    locals = System.Text.RegularExpressions.Regex.Matches(source, @"__LOCAL_[A-Za-z0-9_]+__").Count;
+    return natives + locals;
 }
 
 static void RegisterArrayTypes(UELib.Core.UStruct structObj)
