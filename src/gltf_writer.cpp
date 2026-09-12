@@ -50,6 +50,37 @@ int GltfWriter::add_texture(const std::string& texture_name)
     return static_cast<int>(textures_.size() - 1);
 }
 
+static bool material_is_translucent(const std::string& name, const MaterialInfo& info)
+{
+    static const char* translucency_keywords[] = {
+        "water", "Water", "river", "River", "ocean", "Ocean",
+        "forcefield", "ForceField", "force_field", "Force_Field",
+        "glass", "Glass",
+        "hologram", "Hologram", "Holo",
+        "smoke", "Smoke", "steam", "Steam", "fog", "Fog", "dust", "Dust",
+        "cloud", "Cloud", "sky", "Sky",
+        "blend", "Blend", "translucent", "Translucent",
+        "additive", "Additive", "modulate", "Modulate",
+        "distort", "Distort", "beam", "Beam",
+        "fx_", "FX_", "pfx_", "PFX_",
+        "splash", "Splash",
+        "energy", "Energy", "shield", "Shield",
+    };
+    const int kw_count = sizeof(translucency_keywords) / sizeof(translucency_keywords[0]);
+
+    std::string name_lower = name;
+    for (auto& c : name_lower) c = static_cast<char>(std::tolower(c));
+
+    for (int i = 0; i < kw_count; i++) {
+        std::string kw(translucency_keywords[i]);
+        for (auto& c : kw) c = static_cast<char>(std::tolower(c));
+        if (name_lower.find(kw) != std::string::npos) return true;
+    }
+
+    if (!info.opacity.empty()) return true;
+    return false;
+}
+
 int GltfWriter::add_material(const PskMaterial& psk_mat)
 {
     for (size_t i = 0; i < gltf_materials_.size(); i++) {
@@ -59,14 +90,107 @@ int GltfWriter::add_material(const PskMaterial& psk_mat)
     GltfMaterial mat;
     mat.name = psk_mat.name;
 
+    const MaterialInfo* info = nullptr;
     for (const auto& m : materials_.materials()) {
-        if (m.name == psk_mat.name) {
-            mat.base_color_texture = add_texture(m.diffuse);
-            mat.normal_texture = add_texture(m.normal);
-            mat.metallic_roughness_texture = add_texture(m.specular);
-            mat.emissive_texture = add_texture(m.emissive);
-            break;
+        if (m.name == psk_mat.name) { info = &m; break; }
+    }
+
+    if (info) {
+        mat.albedo_source = info->albedo_source;
+
+        // `albedo_unresolved` means every candidate in the parent chain was a
+        // normal/mask/emissive map: publishing one as `baseColorTexture` is what
+        // produced magenta rocks and periwinkle water. Better to ship no texture
+        // and a neutral factor. The same applies when the chosen texture has no
+        // exported PNG (cubemap faces and other non-2D textures).
+        if (!info->albedo_unresolved) mat.base_color_texture = add_texture(info->diffuse);
+        mat.normal_texture = add_texture(info->normal);
+        mat.metallic_roughness_texture = add_texture(info->specular);
+        mat.emissive_texture = add_texture(info->emissive);
+
+        const bool no_albedo_image = info->albedo_unresolved || mat.base_color_texture < 0;
+
+        if (info->blend_mode_known) {
+            switch (info->blend_mode) {
+                case BlendMode::Masked:
+                    // Cut-out geometry (foliage, ivy, hedges, banners). Bevy's
+                    // masked pass discards below `alpha_cutoff` and still writes
+                    // depth, which BLEND cannot do.
+                    mat.alpha_mode = "MASK";
+                    mat.alpha_cutoff = info->opacity_mask_clip;
+                    mat.alpha_source = "masked";
+                    break;
+                case BlendMode::Translucent:
+                    mat.alpha_mode = "BLEND";
+                    mat.alpha_source = "translucent";
+                    break;
+                case BlendMode::Additive:
+                case BlendMode::Modulate:
+                    // glTF has no additive or modulate blend mode; BLEND is the
+                    // closest the format offers. The alpha handling below decides
+                    // how visible that leaves the surface.
+                    mat.alpha_mode = "BLEND";
+                    mat.alpha_source = "additive";
+                    break;
+                case BlendMode::Opaque:
+                    mat.alpha_mode = "OPAQUE";
+                    mat.alpha_source = "opaque";
+                    break;
+            }
+        } else if (material_is_translucent(psk_mat.name, *info)) {
+            // No blend mode anywhere in the chain: keep the old name heuristic.
+            mat.alpha_mode = "BLEND";
+            mat.alpha_source = "name_heuristic";
         }
+
+        // Restrict two-sidedness to cut-out cards. UE3 marks them `TwoSided`
+        // because a leaf card is seen from both sides; enabling it broadly is
+        // what broke roof shading, since Bevy's `prepare_world_normal` inverts
+        // the normal on the back face of a double-sided material.
+        mat.double_sided = info->two_sided && mat.alpha_mode == "MASK";
+
+        if (no_albedo_image) {
+            if (mat.emissive_texture >= 0) {
+                // Unlit / self-illuminated material (sky dome, city add-on,
+                // lights, holograms): the emissive slot carries the image, so the
+                // diffuse contribution is blacked out rather than lit.
+                mat.base_color_factor[0] = 0.0f;
+                mat.base_color_factor[1] = 0.0f;
+                mat.base_color_factor[2] = 0.0f;
+                mat.alpha_source = "emissive_only";
+            } else if (info->blend_mode == BlendMode::Additive
+                       || info->blend_mode == BlendMode::Modulate) {
+                // An additive surface with no recoverable texture contributes
+                // nothing: adding black to the framebuffer is a no-op. Rendering
+                // it as opaque geometry instead is how a 81920x35840 `Creativity
+                // Wall` boundary blocker turned into a solid grey slab across the
+                // middle of the map.
+                mat.base_color_factor[3] = 0.0f;
+                mat.alpha_source = "additive_noop";
+            } else if (mat.alpha_mode == "BLEND") {
+                // Translucent, but every colour/opacity candidate was a mask or
+                // normal map. Keep the geometry legible as a faint tint rather
+                // than an opaque slab. The exact value is a heuristic — recorded
+                // in `extras.alpha_source` so it is auditable.
+                mat.base_color_factor[0] = 0.5f;
+                mat.base_color_factor[1] = 0.5f;
+                mat.base_color_factor[2] = 0.5f;
+                mat.base_color_factor[3] = 0.35f;
+                mat.alpha_source = "translucent_default";
+            } else {
+                // Genuinely unknown base colour (a material-expression default
+                // the `.mat` dump does not contain). Mid grey reads as untextured
+                // instead of blowing out to white.
+                mat.base_color_factor[0] = 0.5f;
+                mat.base_color_factor[1] = 0.5f;
+                mat.base_color_factor[2] = 0.5f;
+                mat.alpha_source = "opaque_default";
+            }
+        }
+    } else {
+        MaterialInfo bare;
+        bare.name = psk_mat.name;
+        if (material_is_translucent(psk_mat.name, bare)) mat.alpha_mode = "BLEND";
     }
 
     gltf_materials_.push_back(mat);
@@ -187,6 +311,17 @@ bool GltfWriter::write_static_mesh(const std::string& psk_path, const std::strin
         if (m.base_color_texture >= 0) json << ",\"baseColorTexture\": {\"index\": " << m.base_color_texture << "}";
         json << "}";
         if (m.normal_texture >= 0) json << ",\"normalTexture\": {\"index\": " << m.normal_texture << "}";
+        if (m.emissive_texture >= 0) {
+            json << ",\"emissiveTexture\": {\"index\": " << m.emissive_texture << "}";
+            json << ",\"emissiveFactor\": [" << m.emissive_factor[0] << "," << m.emissive_factor[1] << "," << m.emissive_factor[2] << "]";
+        }
+        if (!m.alpha_mode.empty() && m.alpha_mode != "OPAQUE") {
+            json << ",\"alphaMode\": \"" << m.alpha_mode << "\"";
+            if (m.alpha_mode == "MASK") json << ",\"alphaCutoff\": " << m.alpha_cutoff;
+        }
+        if (m.double_sided) json << ",\"doubleSided\": true";
+        json << ",\"extras\": {\"albedo_source\": \"" << m.albedo_source
+             << "\", \"alpha_source\": \"" << m.alpha_source << "\"}";
         json << "}";
         if (i + 1 < gltf_materials_.size()) json << ",";
         json << "\n";

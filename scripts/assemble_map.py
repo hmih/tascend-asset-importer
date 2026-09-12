@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
@@ -525,15 +526,15 @@ def build_mesh_index(mesh_dirs: Iterable[str]) -> MeshIndex:
 
                 mesh_refs = _gltf_mesh_refs(full_path)
                 if not mesh_refs:
+                    # Binary .glb (skeletal meshes) cannot be JSON-parsed, so derive
+                    # the same suffix variants from the path that _gltf_mesh_refs
+                    # would have produced. Registering only the longest form here
+                    # made 3-part refs like `STN_Inventory.Models.SKL_STN_Inventory`
+                    # unresolvable, so skeletal props were silently dropped.
                     rel = os.path.relpath(full_path, mesh_dir)
                     parts = Path(rel).with_suffix('').parts
-                    if len(parts) >= 4:
-                        mesh_refs = ['.'.join(parts[-4:])]
-                    elif len(parts) >= 3:
-                        mesh_refs = ['.'.join(parts[-3:])]
-                    elif len(parts) == 2:
-                        mesh_refs = ['.'.join(parts[-2:])]
-                    else:
+                    mesh_refs = ['.'.join(parts[-n:]) for n in (2, 3, 4) if len(parts) >= n]
+                    if not mesh_refs:
                         continue
 
                 for mesh_ref in mesh_refs:
@@ -555,6 +556,182 @@ def resolve_mesh_ref(mesh_ref: str, mesh_type: MeshType, index: MeshIndex) -> Op
         if p.endswith('.gltf'):
             return p
     return paths[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Archetype (class default object) mesh resolution
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Base structures and deployables (flag stands, inventory/repair stations, base
+# turrets, generators, radar stations, vehicle pads) attach their mesh through a
+# SkeletalMeshComponent/StaticMeshComponent whose ``SkeletalMesh=`` assignment
+# lives in the *class default object*, usually of a parent class. Cooked map
+# actor records only serialise the component *instance* — e.g.
+# ``SkeletalMeshComponent_10`` carrying nothing but ``ReplacementPrimitive=none``
+# — so the mesh is invisible to ``extract_mesh_instances()`` and the structure is
+# never placed.
+#
+# The decompiled ``.uc`` tree does contain the assignment, so walk the class's
+# ``extends`` chain looking for ``begin object name="<component>"`` with a mesh.
+# Resolved props are emitted as a sidecar manifest (``<Map>.props.json``) and
+# instantiated by the client: they are mostly skeletal meshes, which cannot be
+# merged into the combined static glTF buffer.
+
+_ARCHETYPE_COMPONENT_RE = re.compile(
+    r"//\s*Archetype:\s*(SkeletalMeshComponent|StaticMeshComponent)'([^']+)'"
+)
+_UC_EXTENDS_RE = re.compile(r"^class\s+\w+\s+extends\s+(\w+)", re.M)
+
+ArchetypeMesh = Optional[Tuple[MeshType, str]]
+
+
+def build_uc_class_index(code_dir: str) -> Dict[str, str]:
+    """Map UnrealScript class name → .uc path across the decompiled code tree."""
+    index: Dict[str, str] = {}
+    if not code_dir or not os.path.isdir(code_dir):
+        return index
+    for root, _dirs, files in os.walk(code_dir):
+        for fname in files:
+            if fname.endswith('.uc'):
+                index.setdefault(fname[:-3], os.path.join(root, fname))
+    return index
+
+
+def resolve_archetype_mesh(
+    class_name: str,
+    component: str,
+    uc_index: Dict[str, str],
+    cache: Dict[Tuple[str, str], ArchetypeMesh],
+) -> ArchetypeMesh:
+    """Walk `class_name`'s extends chain for a component with a mesh assignment.
+
+    Subclasses frequently override a subobject without repeating its mesh (the
+    mesh is inherited from ``Default__<Parent>.<component>``), so the search must
+    continue up the chain until an assignment is found.
+    """
+    key = (class_name, component)
+    if key in cache:
+        return cache[key]
+
+    result: ArchetypeMesh = None
+    seen: set = set()
+    current = class_name
+    while current and current not in seen:
+        seen.add(current)
+        path = uc_index.get(current)
+        if not path:
+            break
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                text = f.read()
+        except OSError:
+            break
+
+        block = re.search(
+            rf'begin object name="{re.escape(component)}"(.*?)end object', text, re.S
+        )
+        if block:
+            mesh = _MESH_REF_RE.search(block.group(1))
+            if mesh:
+                kind = MeshType.SKELETAL if mesh.group(1) == 'SkeletalMesh' else MeshType.STATIC
+                result = (kind, mesh.group(2))
+                break
+
+        parent = _UC_EXTENDS_RE.search(text)
+        current = parent.group(1) if parent else None
+
+    cache[key] = result
+    return result
+
+
+def collect_archetype_props(
+    actors_json_paths: List[str],
+    uc_index: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """Collect placed meshes whose assignment lives in a class default object.
+
+    Only actors that contribute *no* geometry through their own properties are
+    considered, so ordinary StaticMeshActors keep flowing through the combined
+    glTF path. Returns props in UE3 space (same convention as the glTF instance
+    nodes, which are converted by the root node matrix).
+    """
+    if not uc_index:
+        return []
+
+    cache: Dict[Tuple[str, str], ArchetypeMesh] = {}
+    props: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for path in actors_json_paths:
+        objects = _load_actor_objects(path)
+        component_index = _build_component_mesh_index(objects)
+        for obj in objects:
+            location, rotator, draw_scale, draw_scale3d = _extract_transform(obj.properties)
+            if location is None:
+                continue
+            if _find_mesh_refs(obj, component_index):
+                continue  # already placed via the combined map
+
+            for prop in obj.properties:
+                for _kind, arch_path in _ARCHETYPE_COMPONENT_RE.findall(prop.get('value', '') or ''):
+                    # The archetype path names the *template* component (e.g.
+                    # "FlagStand", "ObjectiveMesh"); the instantiated component is
+                    # named "SkeletalMeshComponent_10".
+                    component = arch_path.rsplit('.', 1)[-1]
+                    resolved = resolve_archetype_mesh(obj.class_, component, uc_index, cache)
+                    if not resolved:
+                        continue
+                    mesh_type, mesh_ref = resolved
+                    # Dedupe per actor by resolved mesh, not by component name:
+                    # actors commonly pair a rendered component with a collision
+                    # component that reuses the same mesh at the same transform
+                    # (e.g. ObjectiveMesh + CollisionMesh), and spawning both
+                    # would just draw the same thing twice.
+                    dedup = (obj.name, mesh_ref)
+                    if dedup in seen:
+                        continue
+                    seen.add(dedup)
+
+                    rotation = ue3_rotator_to_quat(*rotator) if rotator else None
+                    scale = Vec3(
+                        draw_scale3d.x * draw_scale,
+                        draw_scale3d.y * draw_scale,
+                        draw_scale3d.z * draw_scale,
+                    )
+                    props.append({
+                        "actor": obj.name,
+                        "class": obj.class_,
+                        "component": component,
+                        "mesh": mesh_ref,
+                        "mesh_type": mesh_type.value,
+                        "location": list(location),
+                        "rotation": [rotation.x, rotation.y, rotation.z, rotation.w] if rotation else [0.0, 0.0, 0.0, 1.0],
+                        "scale3d": list(scale),
+                    })
+
+    return props
+
+
+def write_props_manifest(
+    output_path: str,
+    props: List[Dict[str, Any]],
+) -> str:
+    """Write the sidecar props manifest next to the assembled map glTF.
+
+    The manifest is written for every map, including non-geometry layers that
+    never reach the glTF merge step, so the directory may not exist yet.
+    """
+    stem = os.path.splitext(os.path.basename(output_path))[0]
+    output_dir = os.path.dirname(output_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+    props_path = os.path.join(output_dir, stem + ".props.json")
+    with open(props_path, "w") as f:
+        json.dump({
+            "map": stem,
+            "prop_count": len(props),
+            "props": props,
+        }, f, indent=2)
+    return props_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -617,6 +794,51 @@ def _read_mesh_buffer(gltf: GltfFile) -> bytes:
                     data.extend(f.read())
             except Exception as e:
                 print(f"  WARNING: Failed to read buffer {buf_path}: {e}", file=sys.stderr)
+    return bytes(data)
+
+
+def _reverse_triangle_winding(combined: Dict[str, Any], buffer: bytes) -> bytes:
+    """Reverse the vertex order of every triangle in the merged meshes.
+
+    The scene hangs off a root node whose matrix is a reflection (det = -1), which
+    mirrors triangle winding. glTF requires renderers to invert winding for
+    negative-determinant transforms and Bevy 0.19 does not, so without this the
+    geometry is back-facing. Marking materials `doubleSided` is *not* an
+    acceptable workaround: Bevy's `prepare_world_normal` inverts the normal on the
+    back face of a double-sided material, so up-facing surfaces (roofs, wall tops)
+    get lit as if they pointed down and receive ambient only. Reversing the
+    winding makes the geometry front-facing again, which restores both culling and
+    correct shading without any material hack.
+    """
+    data = bytearray(buffer)
+    fmt_for = {5121: 'B', 5123: 'H', 5125: 'I'}
+
+    for mesh in combined.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            if "indices" not in prim:
+                continue
+            acc = combined["accessors"][prim["indices"]]
+            fmt = fmt_for.get(acc.get("componentType"))
+            if fmt is None:
+                continue
+            bv = combined["bufferViews"][acc["bufferView"]]
+            base = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
+            size = struct.calcsize(fmt)
+            stride = bv.get("byteStride") or size
+            count = acc["count"]
+
+            # Only triangle lists have a meaningful winding order.
+            if prim.get("mode", 4) != 4 or count < 3:
+                continue
+
+            for t in range(0, count - count % 3, 3):
+                first = base + t * stride
+                third = base + (t + 2) * stride
+                a = struct.unpack_from('<' + fmt, data, first)[0]
+                b = struct.unpack_from('<' + fmt, data, third)[0]
+                struct.pack_into('<' + fmt, data, first, b)
+                struct.pack_into('<' + fmt, data, third, a)
+
     return bytes(data)
 
 
@@ -803,7 +1025,7 @@ def _make_node(
         "mesh": mesh_idx,
         "name": instance.actor_name or f"instance_{node_index}",
         "translation": list(pos),
-        "rotation": [rot.x, rot.y, -rot.z, rot.w],
+        "rotation": [rot.x, rot.y, rot.z, rot.w],
         "scale": list(scl),
         "extras": {
             "mesh_ref": instance.mesh_ref,
@@ -813,16 +1035,49 @@ def _make_node(
     }
 
 
-# Matrix converting UE3 (X=fwd,Y=right,Z=up) → glTF (X=right,Y=up,Z=fwd with +Z=screen-up in top-down).
-# Maps (x,y,z)_ue → (x,z,y)_gltf. Reflection (det=-1); glTF inverts winding for mirrored nodes.
+# Matrix converting UE3 (X=forward, Y=right, Z=up) → glTF (Y=up).
+# Maps (x,y,z)_ue → (x,z,y)_gltf. This is a REFLECTION (det = -1), and that is
+# required, not a mistake: UE3 is left-handed and glTF is right-handed, so a
+# faithful conversion needs an improper transform. Verified against the game —
+# with a camera at the origin facing +X_ue, BloodEagle (Y=-15554) is on the left
+# and DiamondSword (Y=+15549) on the right in both the game and this mapping.
+# The tempting "pure rotation" (x,y,z)->(x,z,-y) has det = +1 and MIRRORS the
+# world (it swaps the two bases), which is why it was reverted in bdd0b832.
+#
+# Because Bevy does not re-wind triangles for negative-determinant node
+# transforms, the mirrored winding is compensated by _reverse_triangle_winding().
+# Never enable `doubleSided` on map materials instead: Bevy's
+# `prepare_world_normal` inverts the normal on the back face of a double-sided
+# material, which darkens every up-facing surface (roofs, wall tops).
+#
 # Column-major 4x4 for glTF node matrix.
 _UE3_TO_GLTF_MATRIX = [1, 0, 0, 0,  0, 0, 1, 0,  0, 1, 0, 0,  0, 0, 0, 1]
+
+
+def _matrix_det3(matrix: List[float]) -> float:
+    """Determinant of the upper-left 3x3 of a column-major glTF matrix."""
+    m = matrix
+    return (
+        m[0] * (m[5] * m[10] - m[6] * m[9])
+        + m[1] * (m[6] * m[8] - m[4] * m[10])
+        + m[2] * (m[4] * m[9] - m[5] * m[8])
+    )
 
 
 def _add_root_node(combined: Dict[str, Any], child_indices: List[int], world_scale: float = 1.0) -> None:
     """Add a root node with the UE3→glTF conversion matrix, parenting all instance nodes."""
     s = world_scale
     matrix = [s, 0, 0, 0,  0, 0, s, 0,  0, s, 0, 0,  0, 0, 0, 1]
+
+    # Guard the handedness decision: this must stay a reflection. A rotation here
+    # silently mirrors the map relative to the game, and would also require
+    # dropping the winding compensation below.
+    det = _matrix_det3(matrix)
+    if det >= 0:
+        raise AssertionError(
+            f"UE3→glTF root must be a reflection (det < 0) for LH→RH fidelity, got det={det}"
+        )
+
     root_node: Dict[str, Any] = {
         "name": "ue3_to_gltf_root",
         "matrix": matrix,
@@ -842,6 +1097,7 @@ def assemble_map(
     skeletal_meshes_dir: Optional[str],
     output_path: str,
     world_scale: float = 1.0,
+    uc_dir: Optional[str] = None,
 ) -> int:
     print(f"Assembling map from {len(actors_json_paths)} actor file(s):")
     for p in actors_json_paths:
@@ -885,6 +1141,30 @@ def assemble_map(
 
     print(f"  Resolved {len(mesh_ref_to_path)} unique meshes from {len(instances)} instances")
 
+    # 3b. Archetype-inherited props (class default objects) → sidecar manifest.
+    # Written for every map so the client can always request it.
+    props: List[Dict[str, Any]] = []
+    if uc_dir:
+        uc_index = build_uc_class_index(uc_dir)
+        found = collect_archetype_props(actors_json_paths, uc_index)
+        gltf_root = os.path.dirname(os.path.abspath(static_meshes_dir))
+        for prop in found:
+            resolved = resolve_mesh_ref(
+                prop["mesh"],
+                MeshType.SKELETAL if prop["mesh_type"] == "skeletal" else MeshType.STATIC,
+                mesh_index,
+            )
+            if not resolved:
+                continue
+            prop["glb"] = os.path.relpath(os.path.abspath(resolved), gltf_root)
+            props.append(prop)
+        print(
+            f"  Archetype props: {len(props)} placed from {len(found)} candidates "
+            f"({len(uc_index)} classes indexed)"
+        )
+    props_path = write_props_manifest(output_path, props)
+    print(f"Wrote {props_path} ({len(props)} props)")
+
     if not mesh_ref_to_path:
         if not instances:
             print("SKIP: No mesh instances in actor data (non-geometry map).")
@@ -908,6 +1188,11 @@ def assemble_map(
     combined, combined_buffer, gltf_out_path, bin_out_path = merge_gltf_assets(
         gltf_files, output_path, textures_base,
     )
+
+    # The root node below is a reflection (det = -1), so compensate the winding it
+    # mirrors rather than relying on two-sided materials (which Bevy shades with an
+    # inverted normal on the back face).
+    combined_buffer = _reverse_triangle_winding(combined, combined_buffer)
 
     # 6. Build mesh_ref → combined mesh index
     mesh_ref_to_idx = _build_mesh_ref_index(gltf_files, mesh_ref_to_path)
@@ -951,6 +1236,7 @@ def main() -> None:
     parser.add_argument("--static-meshes", default="output/gltf/static-meshes", help="Static meshes directory")
     parser.add_argument("--skeletal-meshes", default="output/gltf/skeletal-meshes", help="Skeletal meshes directory")
     parser.add_argument("--world-scale", type=float, default=1.0, help="Scale factor applied to entire world (0.01 for cm->m)")
+    parser.add_argument("--uc-dir", default="src/decompile/code", help="Decompiled .uc tree, used to resolve class-default (archetype) meshes")
     args = parser.parse_args()
 
     if args.all:
@@ -965,7 +1251,7 @@ def main() -> None:
             print(f"Map: {map_name} ({len(json_paths)} files)")
             output_path = os.path.join(args.output, map_name, map_name + ".gltf")
             rc = assemble_map(json_paths, args.static_meshes, args.skeletal_meshes,
-                              output_path, args.world_scale)
+                              output_path, args.world_scale, args.uc_dir)
             if rc != 0:
                 failed += 1
         print(f"\nDone. {len(maps)} maps processed, {failed} failed.")
@@ -980,7 +1266,7 @@ def main() -> None:
 
     output_path = os.path.join(args.output, map_name, map_name + ".gltf")
     sys.exit(assemble_map([args.actors_json], args.static_meshes, args.skeletal_meshes,
-                           output_path, args.world_scale))
+                           output_path, args.world_scale, args.uc_dir))
 
 
 if __name__ == "__main__":

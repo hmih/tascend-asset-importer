@@ -70,6 +70,50 @@ Options:
 5. **Actor extraction** — Shells out to the UELib .NET MapExtractor to parse
    actor placements and properties from .fmap files. Output: `output/gltf/actors/`
 
+## Material resolution
+
+A `.mat` file is a lossy dump: it lists the textures a material references, not
+how they are wired. In particular `Diffuse=` is **not** reliable — when the base
+colour comes from a material-expression default or a parent's parameter, UModel
+falls back to whatever it referenced first, which is frequently a normal or mask
+map. Publishing that as `baseColorTexture` is what produced magenta rocks and
+periwinkle water in the client.
+
+`MaterialResolver` therefore:
+
+1. **Classifies every texture by name suffix** (`_DIF`, `_NRM`, `_MSK`, `_EMI`,
+   `_SPC`, `_OPA`, `_CUB`, plus `CubeFace*`) into a `TexRole`.
+2. **Reads the companion `<name>.props.txt`**, which is a dump of the real UE3
+   object, for the authoritative `BlendMode`, `TwoSided`, `bIsMasked`,
+   `OpacityMaskClipValue` and `Parent`. Only column-0 keys are read; nested
+   `ParameterName` entries are ignored.
+3. **Walks the parent chain** (many map materials are `MaterialInstanceConstant`s
+   whose blend mode and textures live on the parent) and inherits flags and slots.
+4. **Picks each slot by role**: albedo from the nearest ancestor with a
+   role-usable `Diffuse`, then the first `_DIF` in the chain, then the first
+   unsuffixed texture. Emissive prefers a name-matched `_EMI` (materials
+   reference cubemap faces *and* a panorama, and the wrong one renders as a flat
+   white sheet).
+
+Everything guessed is recorded — `albedo_source`, `normal_source`,
+`emissive_source` in `output/gltf/manifests/materials.json`, and
+`extras.albedo_source` / `extras.alpha_source` on each emitted glTF material —
+so a wrong texture can be traced to the rule that chose it.
+
+glTF emission follows from that:
+
+| UE3 | glTF |
+|---|---|
+| `BLEND_Masked` | `alphaMode: MASK` + `alphaCutoff` (UE3 foliage keeps its cut-out in the diffuse PNG's alpha channel) |
+| `BLEND_Translucent` | `alphaMode: BLEND` |
+| `BLEND_Additive` / `Modulate` | `alphaMode: BLEND` (glTF has no additive mode); if nothing can supply a colour it is made fully transparent, because adding black is a no-op |
+| unresolved albedo + emissive | `baseColorFactor` black, emissive carries the image (sky, city add-on, lights) |
+| unresolved albedo, nothing else | neutral grey, never a mask/normal map |
+
+`TwoSided` is honoured **only** for masked cards. Enabling `doubleSided` broadly
+is a trap: Bevy's `prepare_world_normal` inverts the normal on the back face, so
+roofs and wall tops get lit as if they pointed down.
+
 ## Architecture
 
 ```

@@ -27,8 +27,19 @@ struct GltfMaterial {
     int metallic_roughness_texture = -1;
     int emissive_texture = -1;
     float base_color_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // glTF's `emissiveFactor` defaults to [0,0,0], which multiplies an
+    // `emissiveTexture` down to nothing. Whenever an emissive texture is
+    // published the factor must be [1,1,1] or the texture has no effect.
+    float emissive_factor[3] = {1.0f, 1.0f, 1.0f};
     float metallic_factor = 0.0f;
     float roughness_factor = 0.5f;
+    std::string alpha_mode = "OPAQUE";
+    float alpha_cutoff = 0.5f;
+    bool double_sided = false;
+    /// Diagnostic provenance copied into the glTF `extras`, so a renderer-side
+    /// investigation can tell a real texture from a heuristic substitute.
+    std::string albedo_source;
+    std::string alpha_source;
 };
 
 struct GltfPrimitive {
